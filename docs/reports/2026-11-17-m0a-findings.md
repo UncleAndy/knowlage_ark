@@ -37,6 +37,22 @@ bootstrap-цепочка собирает musl статически, и та п�
 не про порчу стора: сочетание просто не собирается Hydra (отсюда и отсутствие в кэше), и
 не собирается здесь.
 
+## Точное место отказа (уточнено по логу сборки)
+
+```
+$ nix log /nix/store/j69x2ba2jgli5bbgfmhjl9vq6g69004s-musl-static-x86_64-unknown-linux-musl-1.2.5.drv | ...
+x86_64-unknown-linux-musl-ar rc lib/libc.a obj/src/... ; x86_64-unknown-linux-musl-... obj/ldso/dynlink.lo
+collect2: fatal error: cannot find 'ld'
+compilation terminated.
+make: *** [Makefile:162: lib/libc.so] Error 1
+```
+
+То есть падает линковка `lib/libc.so` — компоновщик `ld` не найден в окружении сборки мусли. В наборе
+собираемых производных присутствует `x86_64-unknown-linux-musl-binutils-wrapper-2.46` и
+`x86_64-unknown-linux-musl-gcc-wrapper-15.3.0`, но до самой линковки дело не доходит. Комбинация
+`pkgsMusl.pkgsStatic` не собирается Hydra — отсюда и отсутствие в кэше, и то, что дефект никем
+не пойман: это непроверенная в CI комбинация, а не сбой нашего кода.
+
 ## Открытый вопрос (важно не сделать вывод раньше факта)
 
 Отказ выглядит как `cannot find 'ld'` — подозрительно похоже на особенность окружения
