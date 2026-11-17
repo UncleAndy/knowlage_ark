@@ -3,8 +3,20 @@
 #
 # Sequential by design: timings are comparable only when nothing else builds at
 # the same time. Every row records the nixpkgs set that produced it and its
-# provenance (cache / local / rebuilt) - a five-second "build" is a fetch, not
-# a build, and this runner must never report it as one.
+# provenance, because a five-second "nix build" is a substitution from the
+# binary cache, not a compilation.
+#
+# Provenance values:
+#   present - the artifact was already valid in the store, nothing happened
+#   cache   - substituted from cache.nixos.org
+#   local   - compiled here (this is the from-source number)
+#   rebuilt - compiled here after the artifact already existed (forced)
+#
+# --rebuild means "recompile even though the artifact is already there". It is
+# NOT "force a compile": Nix refuses it when the outputs are neither valid nor
+# substitutable ("some outputs ... are not valid, so checking is not possible").
+# So a first build is always plain, and a forced recompile follows only once the
+# artifact exists.
 set -u
 
 usage() { echo "usage: $0 pass1|pass2 [--rebuild] [--targets \"a b\"]" >&2; exit 2; }
@@ -33,15 +45,23 @@ mkdir -p docs/reports
 stamp="$(date +%F)"
 out="docs/reports/${stamp}-m0a-toolchain-${pass}.tsv"
 components="selftest busybox kernel mupdf"
+critical="busybox kernel mupdf"   # selftest builds in seconds, not worth forcing
 
 rev="$(nix flake metadata --json | nix shell nixpkgs#python3 --command python3 -c \
   'import json,sys; print(json.load(sys.stdin)["locks"]["nodes"]["nixpkgs"]["locked"]["rev"])')"
 
 free_gb() { df -BG --output=avail /nix | tail -1 | tr -dc '0-9'; }
+is_critical() { case " $critical " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-arch_note() { # target comp path
-  local comp="$2"
-  local path="$3"
+row() { # target comp setname status provenance seconds size paths note
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "${7:-}" "${8:-}" "$9" | tee -a "$out"
+}
+
+reason() { grep -v '^warning:' "$1" | tail -3 | tr '\n\t' '  ' | cut -c1-400; }
+
+arch_note() { # comp mainpath
+  local comp="$1" path="$2"
   if [ "$comp" = "selftest" ] && [ -f "$path/share/headers.txt" ]; then
     printf '%s | %s' \
       "$(grep -m1 'Machine:' "$path/share/headers.txt" | tr -s ' ' | cut -d: -f2- | sed 's/^ //')" \
@@ -49,69 +69,90 @@ arch_note() { # target comp path
   fi
 }
 
-build_one() { # target comp attr setname
-  local target="$1" comp="$2" attr="$3" setname="$4"
-  local s e path rc err provenance size note
-  err="$(mktemp)"
+# build_run <attr> <extra-args...>: sets RC, PATHS, ERR, SECONDS_TAKEN, PROV
+build_run() {
+  local attr="$1"; shift
+  local s e main
+  ERR="$(mktemp)"
+  main="$(nix eval --raw "$attr.outPath" 2>/dev/null || true)"
+  PROV=unknown
+  if [ -n "$main" ] && nix path-info "$main" >/dev/null 2>&1; then
+    PROV=present
+  fi
   s="$(date +%s)"
-  # A derivation can have several outputs (mupdf ships -bin and -man): keep them
-  # all, but never let a newline leak into a TSV field.
-  if [ -n "$rebuild" ]; then
-    paths="$(nix build --no-link --print-out-paths --rebuild "$attr" 2>"$err")"; rc=$?
-  else
-    paths="$(nix build --no-link --print-out-paths "$attr" 2>"$err")"; rc=$?
-  fi
-  path="$(printf '%s' "$paths" | tr '\n' ',')"
+  PATHS="$(nix build --no-link --print-out-paths "$@" "$attr" 2>"$ERR")"; RC=$?
   e="$(date +%s)"
-  if [ $rc -ne 0 ]; then
-    # Keep the whole reason: a truncated last line hid a real cause once.
-    printf '%s\t%s\t%s\tFAIL\t-\t%s\t-\t-\t%s\n' "$target" "$comp" "$setname" "$((e-s))" \
-      "$(grep -v '^warning:' "$err" | tail -3 | tr '\n\t' '  ' | cut -c1-400)" | tee -a "$out"
-    rm -f "$err"; return 1
+  SECONDS_TAKEN="$((e-s))"
+  if [ $RC -eq 0 ] && [ "$PROV" = "unknown" ]; then
+    if grep -q 'copying path .* from https://cache.nixos.org' "$ERR"; then PROV=cache; else PROV=local; fi
   fi
-  if grep -q 'copying path .* from https://cache.nixos.org' "$err"; then
-    provenance=cache
-  elif [ -n "$rebuild" ]; then
-    provenance=rebuilt
-  else
-    provenance=local
+  rm -f "$ERR"; ERR="$(mktemp)"; return 0
+}
+
+# run_component <target> <comp> <attr> <setname>
+run_component() {
+  local target="$1" comp="$2" attr="$3" setname="$4"
+  local paths err_file size note prov
+
+  err_file="$(mktemp)"
+  if ! nix build --no-link --print-out-paths "$attr" >/dev/null 2>"$err_file"; then
+    row "$target" "$comp" "$setname" FAIL - 0 "" "" "$(reason "$err_file")"
+    rm -f "$err_file"; return 1
   fi
+  rm -f "$err_file"
+
+  # Plain build first, timed and measured.
+  build_run "$attr"
+  paths="$PATHS"; prov="$PROV"
   size="$(printf '%s' "$paths" | tr '\n' '\0' | xargs -0 du -sb 2>/dev/null | awk '{s+=$1} END {print s+0}')"
-  note="$(arch_note "$target" "$comp" "$(printf '%s\n' "$paths" | head -1)")"
-  printf '%s\t%s\t%s\tPASS\t%s\t%s\t%s\t%s\t%s\n' "$target" "$comp" "$setname" \
-    "$provenance" "$((e-s))" "$size" "$path" "$note" | tee -a "$out"
-  rm -f "$err"; return 0
+  note="$(arch_note "$comp" "$(printf '%s\n' "$paths" | head -1)")"
+  row "$target" "$comp" "$setname" PASS "${prov}" "$SECONDS_TAKEN" "$size" \
+    "$(printf '%s' "$paths" | tr '\n' ',')" "$note"
+
+  # Then, for critical components, a genuine recompile if nothing was compiled above.
+  if [ -n "$rebuild" ] && is_critical "$comp" && [ "$prov" != "local" ]; then
+    build_run "$attr" --rebuild
+    if [ $RC -ne 0 ]; then
+      row "$target" "$comp" "$setname" FAIL - "$SECONDS_TAKEN" "" "" "--rebuild refused: $(tail -2 "$ERR" | tr '\n\t' '  ' | cut -c1-300)"
+      return 0
+    fi
+    paths="$PATHS"
+    size="$(printf '%s' "$paths" | tr '\n' '\0' | xargs -0 du -sb 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+    row "$target" "$comp" "$setname" PASS "rebuilt" "$SECONDS_TAKEN" "$size" \
+      "$(printf '%s' "$paths" | tr '\n' ',')" "forced local recompile (was ${prov})"
+  fi
+  return 0
 }
 
 {
   printf '# KOVCHEG M0a toolchain run: %s\n' "$pass"
   printf '# nixpkgs rev: %s\n' "$rev"
   printf '# nproc: %s\n' "$(nproc)"
-  printf '# rebuild: %s\n' "${rebuild:-no}"
+  printf '# rebuild requested: %s\n' "${rebuild:-no}"
   printf '# free /nix before: %sG\n' "$(free_gb)"
   printf 'target\tcomponent\tset\tstatus\tprovenance\tseconds\tsizeBytes\tstorePath\tnote\n'
 } | tee "$out"
 
 for target in $targets; do
-  verdict=PASS; reason=""
+  verdict=PASS; reason_txt=""
   for comp in $components; do
     if [ "$(free_gb)" -lt 20 ]; then
-      printf '%s\t%s\t-\tSKIP\t-\t0\t-\t-\tstopped: less than 20G free in /nix\n' "$target" "$comp" | tee -a "$out"
-      verdict=FAIL; reason="ran out of disk"; break
+      row "$target" "$comp" - SKIP - 0 "" "" "stopped: less than 20G free in /nix"
+      verdict=FAIL; reason_txt="ran out of disk"; break
     fi
-    if ! build_one "$target" "$comp" ".#probe-${target}-${comp}" preferred; then
+    if ! run_component "$target" "$comp" ".#probe-${target}-${comp}" preferred; then
       if [ "$comp" = "kernel" ]; then
-        printf '%s\t%s\t-\tFAIL\t-\t0\t-\t-\tno fallback set exists for the kernel\n' "$target" "$comp" | tee -a "$out"
-        verdict=FAIL; reason="${reason:+$reason; }kernel failed with the configured fragment"
-      elif build_one "$target" "$comp" ".#probe-${target}-${comp}-fallback" fallback; then
+        row "$target" "$comp" - FAIL - 0 "" "" "no fallback set exists for the kernel"
+        verdict=FAIL; reason_txt="${reason_txt:+$reason_txt; }kernel failed with the configured fragment"
+      elif run_component "$target" "$comp" ".#probe-${target}-${comp}-fallback" fallback; then
         [ "$verdict" = "PASS" ] && verdict=PARTIAL
-        reason="${reason:+$reason; }${comp} needed the fallback set"
+        reason_txt="${reason_txt:+$reason_txt; }${comp} needed the fallback set"
       else
-        verdict=FAIL; reason="${reason:+$reason; }${comp} failed in both sets"
+        verdict=FAIL; reason_txt="${reason_txt:+$reason_txt; }${comp} failed in both sets"
       fi
     fi
   done
-  printf 'VERDICT\t%s\t%s\t%s\n' "$target" "$verdict" "${reason:-all components built}" | tee -a "$out"
+  printf 'VERDICT\t%s\t%s\t%s\n' "$target" "$verdict" "${reason_txt:-all components built}" | tee -a "$out"
 done
 
 printf '# free /nix after: %sG\n' "$(free_gb)" | tee -a "$out"
