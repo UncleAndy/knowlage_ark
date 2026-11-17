@@ -1,5 +1,0 @@
-# KOVCHEG M0a interim measurement: static selftest per target
-# nixpkgs rev: f68407657ad294471eb4b2e65d193df26edf729f
-# nproc: 16
-# note: cross targets are verified by readelf only, not executed here
-target	status	seconds	sizeBytes	elf_machine	run_output	storePath
