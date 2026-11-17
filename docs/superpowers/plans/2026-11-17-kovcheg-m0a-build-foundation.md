@@ -19,6 +19,8 @@
 - All numbers are measured on this machine, one build at a time, with `nproc` recorded. No estimated timings in the report.
 - Every task ends with a commit; `git status` is clean between tasks.
 - Every report row carries its provenance: `cache` (substituted from cache.nixos.org), `local` (compiled on this machine), `rebuilt` (compiled here with `--rebuild`). A five-second `nix build` is a fetch, not a build, and its duration is never quoted as a build time.
+- Provenance has four values: `present` (the artifact was already valid in the store, nothing happened), `cache`, `local`, `rebuilt`. Zero seconds means `present`, never "a very fast build".
+- `--rebuild` is not "force a compile": Nix refuses it when the outputs are neither valid nor substitutable (`some outputs ... are not valid, so checking is not possible`). A first build is always plain; a forced recompile follows only for critical components, once the artifact exists.
 
 ## Review Focus
 
