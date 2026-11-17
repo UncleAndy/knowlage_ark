@@ -40,7 +40,8 @@ rev="$(nix flake metadata --json | nix shell nixpkgs#python3 --command python3 -
 free_gb() { df -BG --output=avail /nix | tail -1 | tr -dc '0-9'; }
 
 arch_note() { # target comp path
-  local comp="$2" path="$3"
+  local comp="$2"
+  local path="$3"
   if [ "$comp" = "selftest" ] && [ -f "$path/share/headers.txt" ]; then
     printf '%s | %s' \
       "$(grep -m1 'Machine:' "$path/share/headers.txt" | tr -s ' ' | cut -d: -f2- | sed 's/^ //')" \
@@ -53,15 +54,19 @@ build_one() { # target comp attr setname
   local s e path rc err provenance size note
   err="$(mktemp)"
   s="$(date +%s)"
+  # A derivation can have several outputs (mupdf ships -bin and -man): keep them
+  # all, but never let a newline leak into a TSV field.
   if [ -n "$rebuild" ]; then
-    path="$(nix build --no-link --print-out-paths --rebuild "$attr" 2>"$err")"; rc=$?
+    paths="$(nix build --no-link --print-out-paths --rebuild "$attr" 2>"$err")"; rc=$?
   else
-    path="$(nix build --no-link --print-out-paths "$attr" 2>"$err")"; rc=$?
+    paths="$(nix build --no-link --print-out-paths "$attr" 2>"$err")"; rc=$?
   fi
+  path="$(printf '%s' "$paths" | tr '\n' ',')"
   e="$(date +%s)"
   if [ $rc -ne 0 ]; then
+    # Keep the whole reason: a truncated last line hid a real cause once.
     printf '%s\t%s\t%s\tFAIL\t-\t%s\t-\t-\t%s\n' "$target" "$comp" "$setname" "$((e-s))" \
-      "$(tail -1 "$err" | tr '\t' ' ' | cut -c1-200)" | tee -a "$out"
+      "$(grep -v '^warning:' "$err" | tail -3 | tr '\n\t' '  ' | cut -c1-400)" | tee -a "$out"
     rm -f "$err"; return 1
   fi
   if grep -q 'copying path .* from https://cache.nixos.org' "$err"; then
@@ -71,8 +76,8 @@ build_one() { # target comp attr setname
   else
     provenance=local
   fi
-  size="$(du -sb "$path" | cut -f1)"
-  note="$(arch_note "$target" "$comp" "$path")"
+  size="$(printf '%s' "$paths" | tr '\n' '\0' | xargs -0 du -sb 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+  note="$(arch_note "$target" "$comp" "$(printf '%s\n' "$paths" | head -1)")"
   printf '%s\t%s\t%s\tPASS\t%s\t%s\t%s\t%s\t%s\n' "$target" "$comp" "$setname" \
     "$provenance" "$((e-s))" "$size" "$path" "$note" | tee -a "$out"
   rm -f "$err"; return 0
